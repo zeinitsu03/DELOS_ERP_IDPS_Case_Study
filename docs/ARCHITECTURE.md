@@ -1,45 +1,161 @@
 # Architecture
 
-DELOS ERP IDPS is designed as a layered ERP security platform rather than a single IDS model. The main idea is to keep ERP business logic, traffic inspection, detection, and monitoring separated.
+DELOS is a layered system rather than a single IDS model. ERP business logic, traffic
+enforcement, detection and monitoring each live in their own service, with explicit trust
+boundaries between them.
 
-## High-Level Flow
+## Services
 
-![Middleware flow](../assets/diagrams/middleware_flow.png)
+```mermaid
+flowchart LR
+    subgraph clients [Clients]
+        P[ERP portal<br/>React + Vite]
+        S[SOC dashboard<br/>React + Vite]
+    end
+    subgraph public [Public]
+        G[Security gateway<br/>FastAPI]
+    end
+    subgraph internal [Internal network]
+        I[IDS engine<br/>FastAPI + scikit-learn]
+        E[ERP API<br/>Flask]
+        D[(PostgreSQL / SQLite)]
+        M[/Trained models<br/>read-only/]
+    end
+    T[Telegram]
 
-1. A user interacts with the ERP portal.
-2. Requests go through the middleware gateway instead of directly reaching the ERP service.
-3. Middleware checks source behavior, request patterns, endpoint sensitivity, and block state.
-4. Safe requests are forwarded to the ERP backend.
-5. Security-relevant telemetry is sent to the IDS service.
-6. IDS analysis produces alerts, risk scores, incidents, and dashboard events.
+    P -- HTTPS --> G
+    S -- "SOC API (signed token) + WebSocket" --> G
+    G -- "inspect, outcome (API key)" --> I
+    I -- "decision + risk" --> G
+    G -- "forward (shared secret)" --> E
+    I --> D
+    E --> D
+    M --> I
+    I -- "verified contacts only" --> T
+```
 
-## Runtime Components
+| Service | Responsibility |
+|---|---|
+| Security gateway | Only public entry point. Enforcement pipeline, proxying to the ERP, SOC API, live WebSocket |
+| IDS engine | Feature extraction, ML inference, behaviour detectors, ERP role rules, risk scoring, alerts, incidents, correlation, auto-block, notifications |
+| ERP API | Students, faculty, admin, courses, enrollments, fees, library, audit logs |
+| ERP portal | Role-based UI for students, faculty and admins |
+| SOC dashboard | Monitoring, investigation and response UI for security operators |
 
-| Layer | Purpose |
-| --- | --- |
-| ERP portal | Realistic student/admin ERP workflows |
-| Middleware gateway | Inspection, enforcement, request forwarding, alert stream |
-| ERP API | Core academic ERP data and actions |
-| IDS API | Detection, scoring, correlation, ML pipeline visibility |
-| Admin dashboard | SOC-style monitoring and response interface |
-| Persistence | Events, alerts, incidents, risk, audit data |
+Code that more than one service needs (settings, database connection, WAF signatures, ML feature
+extraction, attack taxonomy, signed tokens) lives in a shared package rather than being copied.
 
-## Database View
+## Trust boundaries
 
-![Database design](../assets/diagrams/database_design.png)
+```
+browser ──► gateway (public) ──► IDS (internal)
+                     └─────────► ERP (internal)
+```
 
-The database design supports ERP records, audit trails, SIEM-style events, alerts, incidents, risk scores, and dashboard state.
+- **The gateway is the only public service.** The ERP rejects any request that doesn't carry the
+  gateway's shared secret, so nobody can reach the ERP around the IDS.
+- **The IDS is internal.** Every IDS call needs an API key. The SOC dashboard never talks to the
+  IDS directly: it signs in to the gateway, receives a signed token, and the gateway proxies the
+  SOC API. One login and one CORS origin cover the whole dashboard.
+- **The database is backend-only.** Frontends never hold database credentials. The first version
+  shipped a database key in the browser bundle and relied entirely on row-level-security policies
+  being correct; the rewrite removed that exposure.
 
-## Risk and Correlation
+## Request pipeline
 
-![Risk engine](../assets/diagrams/risk_engine.png)
+The gateway runs its checks in order of cost:
 
-Risk scoring combines behavior, endpoint sensitivity, temporal activity, attack indicators, and source reputation. Correlation turns repeated or related alerts into incident-level records.
+1. **Block list.** In-memory cache synced from the IDS every few seconds. Blocks the gateway adds
+   itself take effect immediately and survive a sync, even while the IDS is unreachable.
+2. **Honeypot paths** such as `/.env` or `/wp-admin`. No legitimate user asks for these, so the
+   source is blocked straight away.
+3. **Rate limits.** Keyed per signed-in user (from a verified token), or per IP for anonymous
+   clients.
+4. **WAF signatures.** Input is URL-decoded twice so double encoding doesn't slip through.
+   Scripted clients (curl, python-requests) are *flagged*, not blocked, because monitoring scripts
+   are legitimate too.
+5. **IDS inspect.** The gateway sends request features, user and role; the IDS returns
+   `allow` / `flag` / `block` plus a risk score.
+6. **Forward to the ERP**, then report the **outcome** (status code, latency) to the IDS. Outcomes
+   drive the brute-force and enumeration detectors: a 401 on the login endpoint counts as a
+   failed login.
 
-![Correlation engine](../assets/diagrams/correlation_engine.png)
+### Failure behaviour
 
-## ERP-Agnostic Design
+| Mode | IDS unreachable | Client IP from `X-Forwarded-For` | Demo data |
+|---|---|---|---|
+| `demo` | Fail open | Trusted from localhost (to simulate attackers) | Yes |
+| `development` | Fail open | Trusted only from configured proxies | Yes |
+| `production` | **Fail closed (503)** | Trusted only from configured proxies | No; weak or default secrets are refused at startup |
 
-![ERP profile architecture](../assets/diagrams/erp_architecture.png)
+A circuit breaker stops the gateway from waiting on a dead IDS for every request.
 
-The private implementation includes profile concepts for academic, healthcare, industrial, retail, and corporate ERP domains. This allows sensitivity and risk logic to change based on the business context instead of hardcoding only one college ERP scenario.
+## Live updates
+
+As the gateway processes traffic it publishes live events (each request's outcome, new alerts
+returned by the IDS, and blocks) to signed-in dashboards over an authenticated WebSocket. Each
+client has a bounded queue, so a slow browser drops old events instead of slowing the gateway.
+The dashboard doesn't depend on a database vendor's realtime feature.
+
+## Data model
+
+Both backends create their own tables on startup. Table names are prefixed per service, so the
+ERP and the IDS can share one PostgreSQL database without clashing.
+
+```mermaid
+flowchart LR
+    subgraph erp [ERP tables]
+        U[users] --- ST[students]
+        U --- FP[faculty profiles]
+        ST --- EN[enrollments] --- C[courses]
+        ST --- F[fees]
+        L[library items]
+        A[audit logs]
+    end
+    subgraph ids [IDS tables]
+        TR[traffic] --> AL[alerts]
+        AL --> IN[incidents] --> IE[incident events<br/>timeline]
+        CR[correlation rules] --> IN
+        AL --> B[blocked IPs]
+        NC[notification contacts]
+        SE[settings]
+    end
+```
+
+- **Traffic** holds every inspected request and is purged after a retention period.
+  **Alerts and incidents** are kept.
+- **Incident events** form the investigation timeline: system actions and analyst notes.
+- **Correlation rules** live in the database, so operators can edit them from the dashboard.
+- No migration tool yet. That's acceptable while the schema is young; Alembic would be the next
+  step before altering a table that holds data worth keeping.
+- SQLite runs in WAL mode with a busy timeout for demos. PostgreSQL/Supabase is used for shared
+  deployments. If a PostgreSQL URL is configured but unreachable, the services **stop with an
+  explanation** instead of silently falling back to SQLite, which would produce an empty dashboard
+  with no clue why.
+
+## Deployment
+
+| Target | Notes |
+|---|---|
+| Local | One script starts all five services and prints the URLs; SQLite by default |
+| Docker Compose | Only the gateway and the two frontends are published. ERP and IDS sit on the internal network. Models are mounted read-only. |
+| Kubernetes | Namespace + config, backend deployments, frontends, ingress and network policy. Secrets come from a Kubernetes Secret, not config maps. |
+
+A database diagnostics script checks DNS, TCP, login and tables one step at a time, and prints the
+fix for each common failure (wrong pooler username, paused free-tier project, IPv6-only host, wrong
+password).
+
+## Scaling limits
+
+Rate-limit windows, failed-login counters, the block cache and IDS behaviour windows live in
+process memory. The gateway and the IDS therefore **must run as one process each**. Scaling out
+would need a shared store such as Redis. For a single university ERP that is more infrastructure
+than it's worth, so it's documented as a known limit rather than half-built.
+
+## ERP domain profiles
+
+Endpoint sensitivity, role permissions and per-role request-rate limits are defined in an ERP
+domain configuration instead of being hardcoded. The active profile is the academic ERP. Profiles
+for other domains (healthcare, retail, industrial, corporate) exist as configuration examples of
+how the same engine would be adapted; only the academic profile is exercised by the ERP in this
+project.
