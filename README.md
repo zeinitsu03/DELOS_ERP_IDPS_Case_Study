@@ -229,4 +229,4 @@ formal review I can share my screen and walk through the code, or grant temporar
 
 ---
 
-© 2026 Zeintisu03. All rights reserved — see [LICENSE](LICENSE).
+© 2026 zeinitsu03. All rights reserved — see [LICENSE](LICENSE).
