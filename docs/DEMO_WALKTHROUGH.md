@@ -1,66 +1,80 @@
-# Demo Walkthrough
+# Demo walkthrough
 
-This is the demo flow I use to explain the project in interviews or reviews.
+The flow I use to present DELOS in a review or interview. It takes about 10 minutes live and works
+from the screenshots alone if a live demo isn't possible.
 
-## 1. Explain the Problem
+## 1. The problem (1 min)
 
-ERP systems hold high-value records such as student data, attendance, fees, grades, identity information, and admin actions. A normal ERP backend can authenticate users, but it often lacks real-time detection, correlation, and response.
+ERP systems hold identities, grades, attendance, fees and admin actions. They authenticate users
+and keep logs, but nothing inspects traffic in real time, links related events, or stops an
+attacker mid-attempt.
 
-## 2. Show the Architecture
+## 2. The architecture (2 min)
 
-Open the architecture diagram and explain the separation between:
+Show the diagram in the [README](../README.md#architecture) and make three points:
 
-- ERP portal
-- Middleware gateway
-- ERP API
-- IDS service
-- Admin dashboard
-- Persistence layer
+- The **gateway is the only public service**. The ERP rejects traffic that didn't pass through it.
+- The **IDS is internal** and decides; the gateway enforces.
+- The **dashboard talks only to the gateway**, never to the database.
 
-![ERP IDS architecture](../assets/diagrams/erp_ids_architecture.png)
+## 3. The protected ERP is real (1 min)
 
-## 3. Show Normal ERP Usage
-
-Use the ERP student dashboard to show that the protected application is realistic and not only a security dashboard.
+Sign in to the portal as a student. The point is that this is a working ERP with real workflows
+(courses, attendance, fees, library), not only a security dashboard.
 
 ![ERP student dashboard](../assets/screenshots/erp-student-dashboard.png)
 
-## 4. Explain Prevention
+## 4. Normal traffic stays clean (1 min)
 
-Show the blocked login flow and explain that risky sources can be stopped before reaching protected ERP workflows.
+Run the traffic generator. It signs in as the demo users and browses like real people, then
+reports how many normal requests were wrongly blocked. This is the false-positive check, and it's
+the number I care about most: a security layer that blocks students doesn't get deployed.
 
-![Blocked ERP login](../assets/screenshots/erp-blocked-login.png)
+## 5. Attack it (2 min)
 
-## 5. Show SOC Monitoring
+Live, in this order:
 
-Open the security posture and incident views. Explain how alerts become incidents and how operators can inspect severity, source IPs, event counts, and timelines.
+1. Request `/.env` → honeypot hit, the source is blocked instantly.
+2. Send a SQL injection payload to a search endpoint → WAF signature, request blocked.
+3. Sign in with a wrong password several times → the brute-force detector fires on the login
+   outcomes and blocks the IP.
+4. As a student, call an admin endpoint → role boundary violation.
 
-![Security posture overview](../assets/screenshots/admin-security-posture-overview.png)
+Then open the SOC dashboard; the live feed has already shown every one of them.
 
-![Incidents](../assets/screenshots/admin-incidents.png)
+![SOC overview](../assets/screenshots/soc-overview.png)
 
-## 6. Explain Analysis Views
+## 6. Triage and investigate (2 min)
 
-Use sequence analysis, attacker profiles, and sessions to explain investigation workflows.
+- **Alerts**: repeats are grouped per source and type; risk and block status are visible.
+- **Incident**: open the brute-force incident. Walk through the kill-chain progress, the alert
+  that opened it, and the timeline (opened by rule → alert → IP blocked). Show owner, status and
+  the unblock button.
+- **Attacker profile**: everything about one source in one place.
 
-![Sequence analysis](../assets/screenshots/admin-sequence-analysis.png)
+![Alerts](../assets/screenshots/soc-alerts.png)
 
-![Attacker profiles](../assets/screenshots/admin-attacker-profiles.png)
+![Incident detail](../assets/screenshots/soc-incident-detail.png)
 
-## 7. Show Model and Pipeline Visibility
+![Attacker detail](../assets/screenshots/soc-attacker-detail.png)
 
-Use model health and pipeline monitor screens to show that the ML system is observable.
+## 7. Tuning and ML (1 min)
 
-![Model health](../assets/screenshots/admin-model-health.png)
+- **Correlation rules** are data, not code: toggle one, edit its threshold.
+- **Detection models** page: model status, thresholds, WAF signature groups, and the export of
+  analyst-labelled alerts for retraining. If the models aren't trained, the dashboard says so and
+  detection continues on signatures and rules; that's a deliberate design choice, not a failure.
 
-![Pipeline monitor](../assets/screenshots/admin-pipeline-monitor.png)
+![Correlation rules](../assets/screenshots/soc-rules.png)
 
-## 8. Close With Engineering Tradeoffs
+![Detection models](../assets/screenshots/soc-models.png)
 
-Key tradeoffs to discuss:
+## 8. Close with trade-offs
 
-- Middleware centralization gives strong visibility but must be highly reliable.
-- ML should support detection decisions, not replace deterministic security controls.
-- Risk scoring needs explainability so operators can trust the system.
-- False positives need feedback and review flows.
-- Production use would require stronger secret handling, CI, monitoring, and policy enforcement.
+- Centralising enforcement in the gateway gives full visibility, but the gateway must be reliable,
+  so it fails closed in production and uses a circuit breaker.
+- ML supports decisions; deterministic controls make the high-confidence ones. An anomaly score
+  alone never blocks.
+- Scoring is explainable by construction, so operators can trust it and tune it.
+- The version I show is a rewrite. I removed features that looked good but weren't real (see
+  [Design decisions](DESIGN_DECISIONS.md#the-rewrite-v1--v2)).
